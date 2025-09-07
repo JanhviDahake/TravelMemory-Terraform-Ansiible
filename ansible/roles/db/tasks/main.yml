@@ -1,0 +1,94 @@
+---
+- name: Add MongoDB apt key
+  apt_key:
+    url: https://pgp.mongodb.com/server-7.0.asc
+    state: present
+  become: yes
+
+- name: Add MongoDB repo
+  apt_repository:
+    repo: "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse"
+    state: present
+  become: yes
+
+- name: Install MongoDB packages
+  apt:
+    name: [mongodb-org]
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Ensure python3-pip is installed
+  apt:
+    name: python3-pip
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Install pymongo for Ansible MongoDB module
+  pip:
+    name: pymongo
+    executable: pip3
+  become: yes
+
+- name: Configure mongod bindIp to private address
+  replace:
+    path: /etc/mongod.conf
+    regexp: '^\s*bindIp:\s*.*$'
+    replace: "  bindIp: 127.0.0.1,{{ mongo_bind_ip }}"
+  become: yes
+
+- name: Enable and start mongod
+  systemd:
+    name: mongod
+    enabled: true
+    state: started
+  become: yes
+
+# Wait for mongod to be listening
+- name: Wait for Mongo on 27017
+  wait_for:
+    host: "{{ mongo_bind_ip }}"
+    port: 27017
+    timeout: 60
+
+# --- MongoDB Users Setup ---
+- name: Create MongoDB admin user
+  community.mongodb.mongodb_user:
+    login_host: localhost
+    login_port: 27017
+    database: admin
+    name: "{{ mongo_admin_user }}"
+    password: "{{ mongo_admin_pass }}"
+    roles: ["userAdminAnyDatabase", "dbAdminAnyDatabase", "readWriteAnyDatabase"]
+    state: present
+  become: yes
+
+- name: Enable authorization (security.authorization)
+  blockinfile:
+    path: /etc/mongod.conf
+    marker: "# {mark} Ansible managed - security"
+    block: |
+      security:
+        authorization: enabled
+  become: yes
+
+- name: Restart mongod to enforce auth
+  systemd:
+    name: mongod
+    state: restarted
+  become: yes
+
+- name: Create application user
+  community.mongodb.mongodb_user:
+    login_host: localhost
+    login_port: 27017
+    login_user: "{{ mongo_admin_user }}"
+    login_password: "{{ mongo_admin_pass }}"
+    database: "{{ mongo_db_name }}"
+    name: "{{ mongo_app_user }}"
+    password: "{{ mongo_app_pass }}"
+    roles: ["readWrite"]
+    state: present
+  become: yes
+# --- End of MongoDB Users Setup ---

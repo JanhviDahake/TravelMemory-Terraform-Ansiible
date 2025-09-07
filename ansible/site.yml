@@ -1,0 +1,198 @@
+---
+# --- DB Setup ---
+- name: Setup MongoDB
+  hosts: db
+  become: yes
+  vars:
+    mongo_bind_ip: "10.0.2.72"  # your private IP
+  tasks:
+    - name: Add MongoDB apt key
+      apt_key:
+        url: https://pgp.mongodb.com/server-7.0.asc
+        state: present
+
+    - name: Add MongoDB repo
+      apt_repository:
+        repo: "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse"
+        state: present
+
+    - name: Install MongoDB packages
+      apt:
+        name: [mongodb-org]
+        state: present
+        update_cache: yes
+
+    - name: Ensure python3-pip is installed
+      apt:
+        name: python3-pip
+        state: present
+
+    - name: Install pymongo for Ansible MongoDB module
+      pip:
+        name: pymongo
+        executable: pip3
+
+    - name: Configure mongod bindIp
+      replace:
+        path: /etc/mongod.conf
+        regexp: '^\s*bindIp:\s*.*$'
+        replace: "  bindIp: 127.0.0.1,{{ mongo_bind_ip }}"
+      notify: Restart MongoDB
+
+    - name: Disable MongoDB auth temporarily
+      lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^#?security:'
+        line: "#security:"
+      notify: Restart MongoDB
+
+    - name: Enable and start mongod
+      systemd:
+        name: mongod
+        enabled: true
+        state: started
+
+    - name: Wait for Mongo on 27017
+      wait_for:
+        host: 127.0.0.1
+        port: 27017
+        timeout: 60
+
+    - name: Create MongoDB admin user
+      community.mongodb.mongodb_user:
+        login_host: 127.0.0.1
+        login_port: 27017
+        database: admin
+        name: "{{ mongo_admin_user }}"
+        password: "{{ mongo_admin_pass }}"
+        roles: ["userAdminAnyDatabase", "dbAdminAnyDatabase", "readWriteAnyDatabase"]
+        state: present
+
+    - name: Enable MongoDB authorization
+      blockinfile:
+        path: /etc/mongod.conf
+        marker: "# {mark} Ansible managed - security"
+        block: |
+          security:
+            authorization: enabled
+      notify: Restart MongoDB
+
+    - name: Create application user
+      community.mongodb.mongodb_user:
+        login_host: 127.0.0.1
+        login_port: 27017
+        login_user: "{{ mongo_admin_user }}"
+        login_password: "{{ mongo_admin_pass }}"
+        database: "{{ mongo_db_name }}"
+        name: "{{ mongo_app_user }}"
+        password: "{{ mongo_app_pass }}"
+        roles: ["readWrite"]
+        state: present
+
+  handlers:
+    - name: Restart MongoDB
+      systemd:
+        name: mongod
+        state: restarted
+
+# --- Web Setup ---
+- name: Setup Web Server
+  hosts: web
+  become: yes
+  vars:
+    node_major: "{{ node_major }}"
+    project_root: "{{ project_root }}"
+    repo_url: "{{ repo_url }}"
+    backend_dir: "{{ backend_dir }}"
+    frontend_dir: "{{ frontend_dir }}"
+  tasks:
+    - name: Install NodeSource setup script
+      command: curl -fsSL https://deb.nodesource.com/setup_{{ node_major }}.x | bash -
+      args:
+        warn: false
+
+    - name: Install Node.js and Nginx
+      apt:
+        name: [nodejs, nginx]
+        state: present
+        update_cache: yes
+
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: Allow HTTP in UFW
+      ufw:
+        rule: allow
+        port: 80
+        proto: tcp
+
+    - name: Clone/update TravelMemory repo
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ project_root }}"
+        version: HEAD
+        update: yes
+        force: yes
+
+    - name: Install backend dependencies
+      npm:
+        path: "{{ project_root }}/{{ backend_dir }}"
+        production: false
+      environment:
+        NODE_OPTIONS: "--max-old-space-size=1024"
+
+    - name: Install frontend dependencies
+      npm:
+        path: "{{ project_root }}/{{ frontend_dir }}"
+        production: false
+
+    - name: Build frontend
+      shell: "npm run build"
+      args:
+        chdir: "{{ project_root }}/{{ frontend_dir }}"
+
+    - name: Write nginx config
+      template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/sites-available/travelmemory.conf
+
+    - name: Enable site and disable default
+      file:
+        src: /etc/nginx/sites-available/travelmemory.conf
+        dest: /etc/nginx/sites-enabled/travelmemory.conf
+        state: link
+
+    - name: Remove default site if exists
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Test and reload nginx
+      shell: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+      when: nginx_test.rc == 0
+
+    - name: Render PM2 ecosystem file
+      template:
+        src: ecosystem.config.js.j2
+        dest: "{{ project_root }}/ecosystem.config.js"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+
+    - name: Start API with PM2
+      shell: "pm2 start {{ project_root }}/ecosystem.config.js && pm2 save"
+      args:
+        creates: "/home/ubuntu/.pm2/dump.pm2"
+
+    - name: Enable PM2 startup on boot
+      shell: "pm2 startup systemd -u ubuntu --hp /home/ubuntu"
